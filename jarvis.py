@@ -46,25 +46,25 @@ MAX_DOUBLE_GAP_S = 0.85
 NOISE_FLOOR_ALPHA = 0.992 # Adaptive background noise calculation speed
 RETRIGGER_RATIO = 0.4
 
-# --- ElevenLabs TTS Settings ------------------------------------------------
-ELEVENLABS_TTS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech"
-ELEVENLABS_MODEL_ID     = "eleven_multilingual_v2"
-
-JARVIS_WELCOME_PHRASE = "Jarvis online. Cybernetic HUD terminals loaded. ElevenLabs voice matrix is operational, sir."
+# --- Python TTS Settings (using pyttsx3) ----------------------------------
+JARVIS_WELCOME_PHRASE = "Jarvis online. Cybernetic HUD terminals loaded. Python voice matrix is operational, sir."
 MACRO_STORAGE_FILE = Path(__file__).resolve().parent / "learned_macros.json"
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv(Path(__file__).resolve().parent / "voice.env", override=False)
 
-# Read ElevenLabs keys after dotenv loads
-ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "").strip()
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+# --- OpenRouter Chat API Settings -----------------------------------------
+OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/messages"
+OPENROUTER_MODEL    = "openrouter/free"
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_TIMEOUT  = 30
 
 # Synchronized Communication Queues
 gui_log_queue = queue.Queue()
 audio_visualization_queue = queue.Queue()
 SYSTEM_ACTIVE = True
 tracer = None
+command_lock = threading.Lock()  # Ensures only one command executes at a time
 
 # --- Cyberpunk Visual Palette Constants ------------------------------------
 BG_MAIN = "#0A0A12"       # Deep Void Black
@@ -87,88 +87,22 @@ queue_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(mess
 log.addHandler(queue_handler)
 
 
-# --- ElevenLabs TTS Dispatcher ----------------------------------------------
+# --- Python Native TTS Dispatcher -------------------------------------------
 def say(text: str) -> None:
-    """
-    Streams text-to-speech via ElevenLabs API and plays it through the default
-    audio output device. Falls back to a log entry if keys are missing.
-    """
+    """Uses pyttsx3 for cross-platform offline text-to-speech."""
     log.info(f"Jarvis: {text}")
-
-    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-        log.warning("[TTS] ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID not set — voice skipped.")
-        return
-
-    url = f"{ELEVENLABS_TTS_ENDPOINT}/{ELEVENLABS_VOICE_ID}"
-    payload = json.dumps({
-        "text": text,
-        "model_id": ELEVENLABS_MODEL_ID,
-        "voice_settings": {"stability": 0.4, "similarity_boost": 0.85},
-    }).encode("utf-8")
-
     try:
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "xi-api-key": ELEVENLABS_API_KEY,
-                "Content-Type": "application/json",
-                "Accept": "audio/mpeg",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            audio_bytes = resp.read()
-
-        import tempfile, wave as wv
-        tmp_mp3 = Path(tempfile.gettempdir()) / "jarvis_tts.mp3"
-        tmp_mp3.write_bytes(audio_bytes)
-        pcm_file = Path(tempfile.gettempdir()) / "jarvis_tts.wav"
-        converted = False
-
-        # Try ffmpeg (most common on Windows/Linux)
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(tmp_mp3), "-ar", "22050", "-ac", "1", "-f", "wav", str(pcm_file)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
-            )
-            if r.returncode == 0 and pcm_file.exists():
-                converted = True
-        except Exception:
-            pass
-
-        # Try mpg123 as fallback
-        if not converted:
-            try:
-                r = subprocess.run(
-                    ["mpg123", "-q", "-w", str(pcm_file), str(tmp_mp3)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
-                )
-                if r.returncode == 0 and pcm_file.exists():
-                    converted = True
-            except Exception:
-                pass
-
-        if converted:
-            with wv.open(str(pcm_file), "rb") as wf:
-                rate = wf.getframerate()
-                frames = wf.readframes(wf.getnframes())
-                audio_np = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-            sd.play(audio_np, samplerate=rate)
-            sd.wait()
-            log.info("[TTS] ElevenLabs audio playback complete.")
-        else:
-            # Last resort: open mp3 with OS default player
-            log.warning("[TTS] ffmpeg/mpg123 not found — opening with OS default player.")
-            if sys.platform == "win32":
-                os.startfile(str(tmp_mp3))
-            else:
-                subprocess.Popen(["xdg-open", str(tmp_mp3)])
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        log.error(f"[TTS] ElevenLabs HTTP {e.code}: {body[:200]}")
+        import pyttsx3
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 150)  # Speed: words per minute
+        engine.setProperty("volume", 1.0)  # Volume: 0.0 to 1.0
+        engine.say(text)
+        engine.runAndWait()
+        log.info("[TTS] Speech playback complete.")
+    except ImportError:
+        log.error("[TTS] pyttsx3 not installed. Install with: pip install pyttsx3")
     except Exception as e:
-        log.error(f"[TTS] ElevenLabs playback failure: {e}")
+        log.error(f"[TTS] Speech synthesis error: {e}")
 
 
 # --- Connectivity Prober ----------------------------------------------------
@@ -257,16 +191,58 @@ def tool_system_automation(action: str, target: str) -> str:
         return f"OS system automation tool runtime error: {e}"
 
 
-# --- Command Response Engine (ElevenLabs Voice Only) ------------------------
+# --- OpenRouter Chat Engine -------------------------------------------------
+def query_openrouter(prompt: str) -> str:
+    """Sends a prompt to the OpenRouter API and returns the response text."""
+    if not OPENROUTER_API_KEY:
+        log.warning("[AI] OPENROUTER_API_KEY not set in .env — set it to enable AI responses.")
+        return "AI key not configured. Please add OPENROUTER_API_KEY to your .env file."
+
+    online_status = "ONLINE" if is_online() else "OFFLINE"
+    system_prompt = (
+        f"You are Jarvis, an advanced cyberpunk autonomous AI assistant. "
+        f"Network status: {online_status}. "
+        "Be concise, direct, and stay in character."
+    )
+    payload = json.dumps({
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": prompt},
+        ],
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            OPENROUTER_ENDPOINT,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "jarvis-agent",
+                "X-Title": "Jarvis",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=OPENROUTER_TIMEOUT) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            text = res["choices"][0]["message"]["content"].strip()
+            log.info("[AI] OpenRouter response received.")
+            return text
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        log.error(f"[AI] OpenRouter HTTP {e.code}: {body[:200]}")
+        return f"AI request failed: HTTP {e.code}"
+    except Exception as e:
+        log.error(f"[AI] OpenRouter error: {e}")
+        return f"AI unreachable: {e}"
+
+
+# --- Command Response Engine ------------------------------------------------
 def agent_reasoning_loop(initial_prompt: str) -> None:
-    """
-    Receives a command string and speaks it back via ElevenLabs TTS.
-    No AI processing — Jarvis acts as a pure voice interface.
-    Type or clap-trigger a command and Jarvis will voice-confirm it.
-    """
+    """Sends command to FreeTheAI DeepSeek and speaks the response via ElevenLabs."""
     log.info(f"[Command Received] {initial_prompt}")
-    # Echo the command back as a spoken confirmation
-    say(f"Received: {initial_prompt}")
+    response = query_openrouter(initial_prompt)
+    say(response)
 
 
 # --- Windows Desktop Observer (Click & Action Tracer) ------------------------
@@ -505,8 +481,10 @@ class CyberpunkHUD(tk.Tk):
 def main() -> int:
     threading.Thread(target=say, args=(JARVIS_WELCOME_PHRASE,), daemon=True).start()
     
-    audio_hardware_thread = threading.Thread(target=hardware_audio_stream_worker, daemon=True)
-    audio_hardware_thread.start()
+    # Audio listening disabled - system is on-demand HUD input only
+    # Uncomment below to re-enable double-clap detection
+    # audio_hardware_thread = threading.Thread(target=hardware_audio_stream_worker, daemon=True)
+    # audio_hardware_thread.start()
             
     hud_window = CyberpunkHUD()
     hud_window.mainloop()
