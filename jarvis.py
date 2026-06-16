@@ -27,6 +27,13 @@ import sounddevice as sd
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
+# Speech recognition for verbal commands
+try:
+    import speech_recognition as sr
+    SPEECH_RECOGNITION_AVAILABLE = True
+except ImportError:
+    SPEECH_RECOGNITION_AVAILABLE = False
+
 # Third-party tracking libraries for macro mechanics
 try:
     from pynput import mouse, keyboard
@@ -53,11 +60,20 @@ MACRO_STORAGE_FILE = Path(__file__).resolve().parent / "learned_macros.json"
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv(Path(__file__).resolve().parent / "voice.env", override=False)
 
-# --- OpenRouter Chat API Settings -----------------------------------------
+# --- Optional AI Fallback (Secondary, not core) ---------------------------
+# Primary: FreeTheAI Gateway
+FREETHEAI_ENDPOINT = "https://api.freetheai.xyz/v1/chat/completions"
+FREETHEAI_MODEL    = "deepseek-r1-distill-qwen-32b"  # or any model from https://freetheai.xyz/models
+FREETHEAI_API_KEY  = os.getenv("FREETHEAI_API_KEY", "").strip()
+
+# Secondary: OpenRouter (fallback if FreeTheAI fails)
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/messages"
 OPENROUTER_MODEL    = "openrouter/free"
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_TIMEOUT  = 30
+
+# --- Google Search Settings (browser-based) --------------------------------
+GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "").strip()
+GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "").strip()
 
 # Synchronized Communication Queues
 gui_log_queue = queue.Queue()
@@ -87,22 +103,59 @@ queue_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(mess
 log.addHandler(queue_handler)
 
 
-# --- Python Native TTS Dispatcher -------------------------------------------
-def say(text: str) -> None:
-    """Uses pyttsx3 for cross-platform offline text-to-speech."""
-    log.info(f"Jarvis: {text}")
+# --- Python Native TTS Dispatcher (System Built-in Voices) ---------------------
+_tts_engine = None
+
+def _init_tts_engine():
+    """Initialize pyttsx3 engine with best available system voice."""
+    global _tts_engine
     try:
         import pyttsx3
-        engine = pyttsx3.init()
-        engine.setProperty("rate", 150)  # Speed: words per minute
-        engine.setProperty("volume", 1.0)  # Volume: 0.0 to 1.0
-        engine.say(text)
-        engine.runAndWait()
-        log.info("[TTS] Speech playback complete.")
+        _tts_engine = pyttsx3.init()
+        _tts_engine.setProperty("rate", 160)  # Speed: words per minute
+        _tts_engine.setProperty("volume", 0.9)  # Volume: 0.0 to 1.0
+        
+        # Get available voices and try to use the best one (Cortana/David/Zira on Windows)
+        voices = _tts_engine.getProperty("voices")
+        if voices:
+            # Prioritize premium/modern voices
+            preferred_names = ["cortana", "david", "zira", "emily", "mark"]
+            selected_voice = voices[0]  # Default to first available
+            
+            for voice in voices:
+                voice_name = voice.name.lower()
+                if any(pref in voice_name for pref in preferred_names):
+                    selected_voice = voice
+                    log.info(f"[TTS] Using voice: {voice.name}")
+                    break
+            
+            _tts_engine.setProperty("voice", selected_voice.id)
+        
+        return True
     except ImportError:
         log.error("[TTS] pyttsx3 not installed. Install with: pip install pyttsx3")
+        return False
     except Exception as e:
-        log.error(f"[TTS] Speech synthesis error: {e}")
+        log.error(f"[TTS] Engine initialization failed: {e}")
+        return False
+
+
+def say(text: str) -> None:
+    """Uses system built-in TTS via pyttsx3 (Windows SAPI, macOS NSpeech, Linux espeak)."""
+    log.info(f"Jarvis: {text}")
+    global _tts_engine
+    
+    if _tts_engine is None:
+        if not _init_tts_engine():
+            log.warning("[TTS] TTS unavailable — voice output skipped.")
+            return
+    
+    try:
+        _tts_engine.say(text)
+        _tts_engine.runAndWait()
+        log.info("[TTS] Speech playback complete.")
+    except Exception as e:
+        log.error(f"[TTS] Playback error: {e}")
 
 
 # --- Connectivity Prober ----------------------------------------------------
@@ -191,58 +244,180 @@ def tool_system_automation(action: str, target: str) -> str:
         return f"OS system automation tool runtime error: {e}"
 
 
-# --- OpenRouter Chat Engine -------------------------------------------------
-def query_openrouter(prompt: str) -> str:
-    """Sends a prompt to the OpenRouter API and returns the response text."""
-    if not OPENROUTER_API_KEY:
-        log.warning("[AI] OPENROUTER_API_KEY not set in .env — set it to enable AI responses.")
-        return "AI key not configured. Please add OPENROUTER_API_KEY to your .env file."
-
-    online_status = "ONLINE" if is_online() else "OFFLINE"
-    system_prompt = (
-        f"You are Jarvis, an advanced cyberpunk autonomous AI assistant. "
-        f"Network status: {online_status}. "
-        "Be concise, direct, and stay in character."
-    )
-    payload = json.dumps({
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": prompt},
-        ],
-    }).encode("utf-8")
-
+def open_google_search(query: str) -> None:
+    """Opens Google search in the default browser (background)."""
     try:
-        req = urllib.request.Request(
-            OPENROUTER_ENDPOINT,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "jarvis-agent",
-                "X-Title": "Jarvis",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=OPENROUTER_TIMEOUT) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            text = res["choices"][0]["message"]["content"].strip()
-            log.info("[AI] OpenRouter response received.")
-            return text
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        log.error(f"[AI] OpenRouter HTTP {e.code}: {body[:200]}")
-        return f"AI request failed: HTTP {e.code}"
+        url = f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+        if sys.platform == "win32":
+            os.startfile(url)
+        elif sys.platform == "darwin":  # macOS
+            subprocess.Popen(["open", url])
+        else:  # Linux
+            subprocess.Popen(["xdg-open", url])
+        log.info(f"[Browser] Opened Google search for: {query}")
     except Exception as e:
-        log.error(f"[AI] OpenRouter error: {e}")
-        return f"AI unreachable: {e}"
+        log.error(f"[Browser] Failed to open search: {e}")
 
 
-# --- Command Response Engine ------------------------------------------------
+def query_ai_fallback(prompt: str) -> str:
+    """Uses AI as fallback helper (NOT core). Tries FreeTheAI first, then OpenRouter."""
+    
+    # Try FreeTheAI first
+    if FREETHEAI_API_KEY:
+        try:
+            payload = json.dumps({
+                "model": FREETHEAI_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+            }).encode("utf-8")
+            
+            req = urllib.request.Request(
+                FREETHEAI_ENDPOINT,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {FREETHEAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                text = res["choices"][0]["message"]["content"].strip()
+                log.info("[AI] FreeTheAI response received.")
+                return text
+        except Exception as e:
+            log.warning(f"[AI] FreeTheAI failed: {e}, trying OpenRouter...")
+    
+    # Fallback to OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            payload = json.dumps({
+                "model": OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+            }).encode("utf-8")
+            
+            req = urllib.request.Request(
+                OPENROUTER_ENDPOINT,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "jarvis-agent",
+                    "X-Title": "Jarvis",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                text = res["choices"][0]["message"]["content"].strip()
+                log.info("[AI] OpenRouter response received.")
+                return text
+        except Exception as e:
+            log.warning(f"[AI] OpenRouter also failed: {e}")
+    
+    return None  # Both AI services unavailable
+
+
+# --- Direct Command Executor (No AI) ----------------------------------------
+def google_search(query: str) -> str:
+    """Uses Google Custom Search API (free tier) to find info."""
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_CX:
+        log.warning("[Search] Google API key/CX not set — using DuckDuckGo fallback.")
+        # Fallback to DuckDuckGo scraping
+        try:
+            encoded = urllib.parse.quote(query)
+            url = f"https://html.duckduckgo.com/html/?q={encoded}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+                if snippets:
+                    text = " ".join([re.sub(r"<[^>]+>", "", s) for s in snippets[:3]])
+                    return f"Found: {text[:300]}"
+                return "No results found."
+        except Exception as e:
+            return f"Search failed: {e}"
+    
+    # Use Google Custom Search
+    try:
+        url = f"https://www.googleapis.com/customsearch/v1?q={urllib.parse.quote(query)}&key={GOOGLE_SEARCH_API_KEY}&cx={GOOGLE_SEARCH_CX}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            if res.get("items"):
+                result = res["items"][0]
+                return f"{result.get('title', '')}: {result.get('snippet', '')[:200]}"
+            return "No results found."
+    except Exception as e:
+        log.error(f"[Search] Google API error: {e}")
+        return "Search unavailable."
+
+
+def execute_command(cmd_text: str) -> str:
+    """Parses and executes commands directly. Falls back to AI for unknown commands."""
+    cmd_lower = cmd_text.lower().strip()
+    
+    # File read
+    if "read" in cmd_lower and "file" in cmd_lower:
+        return "File read: coming soon. Try a search instead."
+    
+    # List directory
+    if "list" in cmd_lower and ("folder" in cmd_lower or "directory" in cmd_lower):
+        try:
+            items = list(Path(".").iterdir())[:10]
+            return "Files: " + ", ".join([i.name for i in items])
+        except Exception as e:
+            return f"Cannot list: {e}"
+    
+    # Open applications
+    if "open" in cmd_lower or "launch" in cmd_lower or "start" in cmd_lower:
+        if "calculator" in cmd_lower:
+            subprocess.Popen("calc.exe" if sys.platform == "win32" else "gnome-calculator")
+            return "Calculator opened."
+        if "notepad" in cmd_lower:
+            subprocess.Popen("notepad.exe" if sys.platform == "win32" else "gedit")
+            return "Notepad opened."
+        if "folder" in cmd_lower or "explorer" in cmd_lower:
+            path = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+            if sys.platform == "win32":
+                os.startfile(path)
+            else:
+                subprocess.Popen(["xdg-open", path])
+            return "File manager opened."
+    
+    # Web search (opens in browser + returns info)
+    if any(x in cmd_lower for x in ["search", "look up", "find", "google", "what is", "who is"]):
+        words = cmd_lower.split()
+        query = " ".join(words[1:]) if len(words) > 1 else cmd_lower
+        open_google_search(query)  # Open in browser background
+        result = google_search(query)
+        return f"Searching: {query}. Browser opened. {result}" if result else f"Searching: {query}. Browser opened."
+    
+    # Time
+    if "time" in cmd_lower:
+        from datetime import datetime
+        return f"Current time: {datetime.now().strftime('%H:%M:%S')}"
+    
+    # Date
+    if "date" in cmd_lower:
+        from datetime import datetime
+        return f"Today: {datetime.now().strftime('%A, %B %d, %Y')}"
+    
+    # Fallback to AI if configured
+    ai_response = query_ai_fallback(cmd_text)
+    if ai_response:
+        return ai_response
+    
+    return f"Command unclear: {cmd_text}. Try: open calculator, search [query], time, date, or ask anything else"
+
+
 def agent_reasoning_loop(initial_prompt: str) -> None:
     """Sends command to FreeTheAI DeepSeek and speaks the response via ElevenLabs."""
     log.info(f"[Command Received] {initial_prompt}")
-    response = query_openrouter(initial_prompt)
-    say(response)
+    response = query_ai_fallback(initial_prompt)
+    if response:
+        say(response)
+    else:
+        say("Command execution framework failed to extract responses.")
 
 
 # --- Windows Desktop Observer (Click & Action Tracer) ------------------------
@@ -290,10 +465,45 @@ class DesktopInteractionTracer:
 tracer = DesktopInteractionTracer()
 
 
+# --- FIXED: Added the missing listen_for_command routine ---------------------
+def listen_for_command() -> str | None:
+    """Listens for hardware microphone stream capture events and returns recognized text."""
+    if not SPEECH_RECOGNITION_AVAILABLE:
+        log.warning("[Speech] speech_recognition library missing. Run: pip install speechRecognition")
+        return None
+
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        log.info("[Speech] Adjusting room matrices for ambient hums...")
+        recognizer.adjust_for_ambient_noise(source, duration=1.0)
+        log.info("[Speech] Terminal audio bridge open. Speak now...")
+        
+        try:
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
+            log.info("[Speech] Transmission captured. Digitizing matrices...")
+            text = recognizer.recognize_google(audio)
+            log.info(f"[Speech Captured] '{text}'")
+            return text
+        except sr.WaitTimeoutError:
+            log.warning("[Speech] Input channel window closed — timeout reached.")
+        except sr.UnknownValueError:
+            log.warning("[Speech] Audio waveforms were too distorted to parse.")
+        except sr.RequestError as e:
+            log.error(f"[Speech] Google voice translation matrix error: {e}")
+    return None
+
+
 def route_command_intent(command_text: str) -> None:
     """Validates structural macro frames before throwing strings to the main Agent Loop."""
     global SYSTEM_ACTIVE
     cmd_clean = command_text.lower().strip()
+    
+    # Listen for verbal command
+    if "listen" in cmd_clean or "hear me" in cmd_clean or "speech" in cmd_clean:
+        recognized_text = listen_for_command()
+        if recognized_text:
+            route_command_intent(recognized_text)  # Recursively process recognized command
+        return
     if any(term in cmd_clean for term in ["terminate", "shutdown", "exit", "go to sleep"]):
         say("Terminating structural HUD matrix loops. Operational status offline.")
         SYSTEM_ACTIVE = False
@@ -402,13 +612,13 @@ class CyberpunkHUD(tk.Tk):
         middle_pane = tk.Frame(self, bg=BG_MAIN)
         middle_pane.pack(fill="both", expand=True, padx=8, pady=2)
 
-        # Audio Matrix Visualizer Frame
+        # Audio Matrix Visualizer Frame (Reflected in image_ed6f1f.png)
         viz_frame = tk.LabelFrame(middle_pane, text=" [ HIGH-FIDELITY STREAM ACOUSTIC SPECTRUM ] ", font=("Consolas", 9, "bold"), bg=BG_PANEL, fg=FG_ACCENT, bd=1, labelanchor="nw")
         viz_frame.pack(fill="x", side="top", pady=4)
         self.canvas = tk.Canvas(viz_frame, height=60, bg=BG_MAIN, highlightthickness=0)
         self.canvas.pack(fill="x", padx=5, pady=5)
 
-        # Log Matrix Scrolled Text Area
+        # Log Matrix Scrolled Text Area (Reflected in image_ed6f1f.png)
         log_frame = tk.LabelFrame(middle_pane, text=" [ COGNITIVE SYSTEM ENGINE ACTIVITY LOGS ] ", font=("Consolas", 9, "bold"), bg=BG_PANEL, fg=FG_TEXT, bd=1, labelanchor="nw")
         log_frame.pack(fill="both", expand=True, side="bottom", pady=4)
         
